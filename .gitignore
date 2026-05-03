@@ -1,0 +1,6 @@
+.env
+venv/
+seen_disclosures.db
+__pycache__/
+*.pyc
+bot_log.txt
