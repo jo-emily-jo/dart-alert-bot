@@ -1,6 +1,8 @@
 .env
+.DS_Store
 venv/
 seen_disclosures.db
 __pycache__/
 *.pyc
 bot_log.txt
+candidates.csv
