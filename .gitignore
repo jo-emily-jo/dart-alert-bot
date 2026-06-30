@@ -5,4 +5,4 @@ seen_disclosures.db
 __pycache__/
 *.pyc
 bot_log.txt
-candidates.csv
+candidates*.csv

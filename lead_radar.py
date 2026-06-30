@@ -43,11 +43,13 @@ DB_PATH = "seen_disclosures.db"           # 투자봇과 같은 파일, 별도 �
 CSV_PATH = "candidates.csv"
 
 # ── 동작 파라미터 ────────────────────────────────────────────────
-LOOKBACK_DAYS = 30                         # 최근 30일
-PBLNTF_TYPES = ["A", "B"]                  # A=정기공시, B=주요사항보고서
+LOOKBACK_DAYS = 90                         # 최근 90일
+# A=정기공시(사업/분기보고서)로 고정. 90일 검증 결과 B(주요사항보고)는 호주 리드 0건이라 제외.
+# 알짜 리드는 해외사업·기후 내용이 실리는 정기공시 본문에 있음.
+PBLNTF_TYPES = ["A"]
 PAGE_COUNT = 100                           # list.json 페이지당 최대 100
-MAX_PAGES_PER_TYPE = 20                    # 공시유형별 최대 페이지 (안전장치)
-MAX_DOCS_TO_SCAN = 300                     # 본문 스캔 상한 (rate limit 보호)
+MAX_PAGES_PER_TYPE = 40                    # 공시유형별 최대 페이지 (안전장치)
+MAX_DOCS_TO_SCAN = 200                     # 운영값. 큰 A타입 본문 ~21초/건 감안 (rate limit 보호)
 DOC_FETCH_SLEEP = 0.4                      # document.xml 호출 간 간격(초)
 SEND_TELEGRAM = True                       # CSV + 텔레그램
 TELEGRAM_FIT_THRESHOLD = 60               # 이 점수 이상만 텔레그램 알림
@@ -333,18 +335,36 @@ CSV_HEADER = [
 ]
 
 
+def _csv_row(r):
+    return [
+        r["corp_name"], r["corp_code"], r["report_nm"], r["rcept_no"],
+        r["rcept_dt"], r["matched_keywords"], r["candidate_score"],
+        r["fit_score"], r["approach_angle"], r["dart_url"],
+    ]
+
+
+def init_csv():
+    """candidates.csv를 새로 열고 헤더만 기록 (건별 append 시작점)."""
+    with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
+        csv.writer(f).writerow(CSV_HEADER)
+
+
+def append_csv_row(row):
+    """후보 1건을 candidates.csv 끝에 즉시 추가해 중간 종료에도 결과를 보존한다.
+    (append 모드는 BOM을 다시 쓰지 않도록 utf-8 사용; BOM은 init_csv가 한 번만 기록)"""
+    with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(_csv_row(row))
+        f.flush()
+
+
 def write_csv(rows):
-    """fit_score 내림차순으로 candidates.csv 작성."""
+    """완주 시 fit_score 내림차순으로 candidates.csv 재작성."""
     rows_sorted = sorted(rows, key=lambda r: r["fit_score"], reverse=True)
     with open(CSV_PATH, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(CSV_HEADER)
         for r in rows_sorted:
-            w.writerow([
-                r["corp_name"], r["corp_code"], r["report_nm"], r["rcept_no"],
-                r["rcept_dt"], r["matched_keywords"], r["candidate_score"],
-                r["fit_score"], r["approach_angle"], r["dart_url"],
-            ])
+            w.writerow(_csv_row(r))
     return rows_sorted
 
 
@@ -398,7 +418,13 @@ def main():
     for i, it in enumerate(fresh, 1):
         rcept_no = it.get("rcept_no", "")
         corp_name = it.get("corp_name", "?")
+        # [진단 로깅] 비매칭 문서도 건별 진행/소요시간을 찍어 어디서 멈췄는지 보이게 함.
+        # (fetch 로직·sleep·백오프·타임아웃 값은 변경하지 않음)
+        t0 = time.time()
         text = get_document_text_full(rcept_no)
+        dt = time.time() - t0
+        print(f"  [{i}/{len(fresh)}] {rcept_no} {corp_name[:14]} "
+              f"— {dt:.1f}s, {len(text) if text else 0}자", flush=True)
         time.sleep(DOC_FETCH_SLEEP)
         if not text:
             continue
@@ -412,7 +438,21 @@ def main():
 
     print(f"\n  1차 통과 후보: {len(candidates)}건")
 
+    # 같은 회사(corp_code) 중복 제거 — candidate_score 최고건만 남겨 유니크 회사 기준으로.
+    # (한 회사가 90일간 여러 주요사항보고를 낸 경우 가장 점수 높은 1건만 평가/출력)
+    by_corp = {}
+    for c in candidates:
+        cc = c["item"].get("corp_code", "") or c["item"].get("rcept_no", "")
+        if cc not in by_corp or c["candidate_score"] > by_corp[cc]["candidate_score"]:
+            by_corp[cc] = c
+    if len(by_corp) != len(candidates):
+        print(f"  corp_code dedup: {len(candidates)} → {len(by_corp)}건 (유니크 회사)")
+    candidates = list(by_corp.values())
+
     print(f"\n[3/3] Claude fit 스코어링 ({CLAUDE_MODEL})...")
+    # 후보가 있을 때만 CSV를 새로 연다(헤더 기록). 0건이면 직전 결과 파일을 보존.
+    if candidates:
+        init_csv()
     rows = []
     for i, c in enumerate(candidates, 1):
         it = c["item"]
@@ -437,13 +477,14 @@ def main():
             "dart_url": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rcept_no}",
         }
         save_lead(row)
+        append_csv_row(row)   # 건별 즉시 기록 — 중간 종료돼도 여기까지는 보존됨
         rows.append(row)
 
     if not rows:
         print("\n새 리드 후보가 없습니다.")
         return
 
-    rows_sorted = write_csv(rows)
+    rows_sorted = write_csv(rows)   # 완주 시 fit_score 내림차순으로 재정렬 재작성
     print(f"\n✅ candidates.csv 작성 완료 ({len(rows_sorted)}건, fit_score 내림차순)")
 
     if SEND_TELEGRAM:
